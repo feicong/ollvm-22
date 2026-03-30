@@ -12,38 +12,40 @@ using namespace llvm;
 std::string readAnnotate(Function *f) {
   std::string annotation = "";
 
-  // Get annotation variable
   GlobalVariable *glob =
       f->getParent()->getGlobalVariable("llvm.global.annotations");
 
-  if (glob != NULL) {
-    // Get the array
-    if (ConstantArray *ca = dyn_cast<ConstantArray>(glob->getInitializer())) {
-      for (unsigned i = 0; i < ca->getNumOperands(); ++i) {
-        // Get the struct
-        if (ConstantStruct *structAn =
-                dyn_cast<ConstantStruct>(ca->getOperand(i))) {
-          if (ConstantExpr *expr =
-                  dyn_cast<ConstantExpr>(structAn->getOperand(0))) {
-            // If it's a bitcast we can check if the annotation is concerning
-            // the current function
-            if (expr->getOpcode() == Instruction::BitCast &&
-                expr->getOperand(0) == f) {
-              ConstantExpr *note = cast<ConstantExpr>(structAn->getOperand(1));
-              // If it's a GetElementPtr, that means we found the variable
-              // containing the annotations
-              if (note->getOpcode() == Instruction::GetElementPtr) {
-                if (GlobalVariable *annoteStr =
-                        dyn_cast<GlobalVariable>(note->getOperand(0))) {
-                  if (ConstantDataSequential *data =
-                          dyn_cast<ConstantDataSequential>(
-                              annoteStr->getInitializer())) {
-                    if (data->isString()) {
-                      annotation += data->getAsString().lower() + " ";
-                    }
-                  }
-                }
-              }
+  if (!glob)
+    return annotation;
+
+  if (ConstantArray *ca = dyn_cast<ConstantArray>(glob->getInitializer())) {
+    for (unsigned i = 0; i < ca->getNumOperands(); ++i) {
+      if (ConstantStruct *structAn =
+              dyn_cast<ConstantStruct>(ca->getOperand(i))) {
+
+        Value *fnOperand = structAn->getOperand(0);
+        Function *annotatedFn = dyn_cast<Function>(fnOperand);
+        if (!annotatedFn) {
+          if (auto *expr = dyn_cast<ConstantExpr>(fnOperand))
+            if (expr->getOpcode() == Instruction::BitCast)
+              annotatedFn = dyn_cast<Function>(expr->getOperand(0));
+        }
+        if (annotatedFn != f)
+          continue;
+
+        Value *noteOperand = structAn->getOperand(1);
+        GlobalVariable *annoteStr = dyn_cast<GlobalVariable>(noteOperand);
+        if (!annoteStr) {
+          if (auto *expr = dyn_cast<ConstantExpr>(noteOperand))
+            if (expr->getOpcode() == Instruction::GetElementPtr)
+              annoteStr = dyn_cast<GlobalVariable>(expr->getOperand(0));
+        }
+        if (annoteStr && annoteStr->hasInitializer()) {
+          if (ConstantDataSequential *data =
+                  dyn_cast<ConstantDataSequential>(
+                      annoteStr->getInitializer())) {
+            if (data->isString()) {
+              annotation += data->getAsString().lower() + " ";
             }
           }
         }
