@@ -1,0 +1,271 @@
+# Copyright (c) 2025-2026 fei_cong(https://github.com/feicong/feicong-course)
+
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 目标Release标签。留空时使用当前分支名
+        required: false
+        default: ""
+        type: string
+      upload:
+        description: 是否上传到Release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      release_name: ${{ steps.vars.outputs.release_name }}
+      upload: ${{ steps.vars.outputs.upload }}
+    steps:
+      - name: Compute variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag=''
+          upload='true'
+
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            if [ -n '${{ inputs.release_tag }}' ]; then
+              release_tag='${{ inputs.release_tag }}'
+            fi
+            upload='${{ inputs.upload }}'
+          fi
+
+          if [ -z "$release_tag" ]; then
+            release_tag='${{ github.ref_name }}'
+          fi
+
+          release_name="OLLVM Plugin (${release_tag})"
+
+          {
+            echo "release_tag=$release_tag"
+            echo "release_name=$release_name"
+            echo "upload=$upload"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.label }} plugin
+    needs: prepare
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            runs_on: ubuntu-24.04
+            archive_ext: tar.xz
+          - label: macos
+            runs_on: macos-15
+            archive_ext: tar.xz
+          - label: windows
+            runs_on: windows-2025
+            archive_ext: zip
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-22-dev cmake ninja-build
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install llvm ninja
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          choco install llvm ninja --yes --no-progress
+          echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+
+      - name: Detect host triple and LLVM dir
+        id: host
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag_safe="$(printf '%s' '${{ needs.prepare.outputs.release_tag }}' | sed 's/[^A-Za-z0-9._-]/-/g')"
+
+          case "${RUNNER_OS}" in
+            Linux)
+              case "$(uname -m)" in
+                x86_64)  host_triple="x86_64-unknown-linux-gnu" ;;
+                aarch64|arm64) host_triple="aarch64-unknown-linux-gnu" ;;
+                *) echo "不支持的Linux架构: $(uname -m)" >&2; exit 1 ;;
+              esac
+              llvm_dir="/usr/lib/llvm-22/lib/cmake/llvm"
+              ;;
+            macOS)
+              case "$(uname -m)" in
+                x86_64) host_triple="x86_64-apple-darwin" ;;
+                arm64)  host_triple="aarch64-apple-darwin" ;;
+                *) echo "不支持的macOS架构: $(uname -m)" >&2; exit 1 ;;
+              esac
+              llvm_dir="$(brew --prefix llvm)/lib/cmake/llvm"
+              ;;
+            Windows)
+              case "${PROCESSOR_ARCHITECTURE}" in
+                AMD64) host_triple="x86_64-pc-windows-msvc" ;;
+                ARM64) host_triple="aarch64-pc-windows-msvc" ;;
+                *) echo "不支持的Windows架构: ${PROCESSOR_ARCHITECTURE}" >&2; exit 1 ;;
+              esac
+              if command -v llvm-config &>/dev/null; then
+                llvm_dir="$(llvm-config --cmakedir)"
+              else
+                llvm_dir="C:/Program Files/LLVM/lib/cmake/llvm"
+              fi
+              ;;
+            *)
+              echo "不支持的操作系统: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+
+          archive_name="ollvm-plugin-${release_tag_safe}-${host_triple}.${{ matrix.archive_ext }}"
+
+          {
+            echo "host_triple=$host_triple"
+            echo "llvm_dir=$llvm_dir"
+            echo "archive_name=$archive_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S obfuscation -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="${{ steps.host.outputs.llvm_dir }}"
+          cmake --build build --parallel
+
+      - name: Package plugin
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_path="$GITHUB_WORKSPACE/${{ steps.host.outputs.archive_name }}"
+          archive_path_output="$archive_path"
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            archive_path_output="$(cygpath -w "$archive_path")"
+            dll_path="$(find build -maxdepth 1 -name 'Obfuscation*.dll' | head -1)"
+            if [ -z "$dll_path" ]; then
+              echo "未找到Obfuscation*.dll" >&2
+              exit 1
+            fi
+            dll_native="$(cygpath -w "$dll_path")"
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path '$dll_native' -DestinationPath '$archive_path_output' -Force"
+          else
+            lib_path="$(find build -maxdepth 1 \( -name 'libObfuscation.so' -o -name 'libObfuscation.dylib' \) | head -1)"
+            if [ -z "$lib_path" ]; then
+              echo "未找到libObfuscation库文件" >&2
+              exit 1
+            fi
+            tar -cJf "$archive_path" -C build "$(basename "$lib_path")"
+          fi
+
+          echo "archive_path=$archive_path_output" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-plugin
+          path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: ${{ needs.prepare.outputs.upload == 'true' }}
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Update release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${{ needs.prepare.outputs.release_tag }}" "${{ github.sha }}"
+          git push origin "refs/tags/${{ needs.prepare.outputs.release_tag }}" --force
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n' \
+              "分支：\`${{ github.ref_name }}\`" \
+              "Release标签：\`${{ needs.prepare.outputs.release_tag }}\`" \
+              "提交：\`${{ github.sha }}\`" \
+              '' \
+              '各平台OLLVM插件归档文件，可与Clang配合使用。' \
+              '' \
+              '使用示例：' \
+              '' \
+              '```bash' \
+              'clang -fpass-plugin=libObfuscation.so -mllvm -fla -mllvm -bcf -mllvm -sub -mllvm -split file.c -o output-file' \
+              '```'
+          } > release-notes.md
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          body_path: release-notes.md
+          files: release-assets/*
+          make_latest: false
