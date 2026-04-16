@@ -115,13 +115,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
-          $installer = Join-Path $env:TEMP "LLVM-installer.exe"
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/clang+llvm-$env:LLVM_VERSION-$arch-pc-windows-msvc.tar.xz"
+          $tarball = Join-Path $env:TEMP "clang-llvm.tar.xz"
+          $extractDir = "C:\LLVM"
           Write-Host "Downloading LLVM $env:LLVM_VERSION from $url"
-          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
-          Write-Host "Installing LLVM $env:LLVM_VERSION..."
-          Start-Process -Wait -FilePath $installer -ArgumentList "/S"
-          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Invoke-WebRequest -Uri $url -OutFile $tarball -UseBasicParsing
+          Write-Host "Extracting LLVM to $extractDir ..."
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          tar xf $tarball -C $extractDir --strip-components=1
+          "$extractDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install ninja (Windows)
         if: runner.os == 'Windows'
@@ -161,11 +164,7 @@ jobs:
                 ARM64) host_triple="aarch64-pc-windows-msvc" ;;
                 *) echo "不支持的Windows架构: ${PROCESSOR_ARCHITECTURE}" >&2; exit 1 ;;
               esac
-              if command -v llvm-config &>/dev/null; then
-                llvm_dir="$(llvm-config --cmakedir)"
-              else
-                llvm_dir="C:/Program Files/LLVM/lib/cmake/llvm"
-              fi
+              llvm_dir="C:/LLVM/lib/cmake/llvm"
               ;;
             *)
               echo "不支持的操作系统: ${RUNNER_OS}" >&2
